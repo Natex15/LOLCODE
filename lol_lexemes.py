@@ -1,0 +1,285 @@
+import re
+import sys
+from typing import List, NamedTuple, Optional, Tuple
+
+
+# represents a single token with its lexeme, classification, line number, and subtype
+class Token(NamedTuple):
+    lexeme: str
+    classification: str
+    line: int = 0
+    subtype: str = ""  # extra literal subtype hint (e.g. NUMBR, NUMBAR)
+
+    # returns lexeme and classification tuple for table display
+    def as_row(self) -> Tuple[str, str]:
+        return (self.lexeme, self.classification)
+
+
+# stores information about a lexical error
+class LexError(NamedTuple):
+    line: int
+    lexeme: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"Lexical error (line {self.line}): {self.message}: {self.lexeme!r}"
+
+
+# classification names shared across members
+CLASS_STRING_DELIMITER = "String Delimiter"
+CLASS_LITERAL = "Literal"
+CLASS_TYPE_LITERAL = "Type Literal"
+CLASS_VAR_IDENT = "Variable Identifier"
+CLASS_FUNC_IDENT = "Function Identifier"
+CLASS_LOOP_IDENT = "Loop Identifier"
+CLASS_COMMENT = "Comment Keyword"
+
+# keyword table mapping classification to list of keywords
+KEYWORD_GROUPS = [
+    ("Code Delimiter",               ["HAI", "KTHXBYE"]),
+    ("Declaration Block Delimiter",  ["WAZZUP", "BUHBYE"]),
+    ("Variable Declaration",         ["I HAS A"]),
+    ("Variable Initialization",      ["ITZ"]),
+    ("Assignment Keyword",           ["R"]),
+    ("Operand Separator",            ["AN"]),
+    ("Output Keyword",               ["VISIBLE"]),
+    ("Input Keyword",                ["GIMMEH"]),
+    ("Concatenation Keyword",        ["SMOOSH"]),
+    ("Arithmetic Operator",          ["SUM OF", "DIFF OF", "PRODUKT OF",
+                                      "QUOSHUNT OF", "MOD OF",
+                                      "BIGGR OF", "SMALLR OF"]),
+    ("Comparison Operator",          ["BOTH SAEM", "DIFFRINT"]),
+    ("Boolean Operator",             ["BOTH OF", "EITHER OF", "WON OF", "NOT"]),
+    ("Infinite Arity Operator",      ["ALL OF", "ANY OF"]),
+    ("Operator Delimiter",           ["MKAY"]),
+    ("Typecast Keyword",             ["MAEK", "IS NOW A", "A"]),
+    ("Conditional Keyword",          ["O RLY?", "YA RLY", "NO WAI", "MEBBE"]),
+    ("Switch-Case Keyword",          ["WTF?", "OMG", "OMGWTF"]),
+    ("Conditional/Switch Delimiter", ["OIC"]),
+    ("Break Keyword",                ["GTFO"]),
+    ("Loop Delimiter",               ["IM IN YR", "IM OUTTA YR"]),
+    ("Loop Keyword",                 ["UPPIN", "NERFIN", "TIL", "WILE"]),
+    ("Function Delimiter",           ["HOW IZ I", "IF U SAY SO"]),
+    ("Return Keyword",               ["FOUND YR"]),
+    ("Function Call Keyword",        ["I IZ"]),
+    ("Parameter Keyword",            ["YR", "AN YR"]),
+    (CLASS_COMMENT,                  ["BTW", "OBTW", "TLDR"]),
+]
+
+# keywords that indicate the following identifier is a function or loop name
+_FUNC_CONTEXT = {"HOW IZ I", "I IZ"}
+_LOOP_CONTEXT = {"IM IN YR", "IM OUTTA YR"}
+
+_END = r"(?=\s|$)"  # lexemes must end at whitespace or end of string
+_WS = r"[ \t]+"
+
+RE_NUMBAR = r"-?[0-9]+\.[0-9]+"
+RE_NUMBR = r"-?[0-9]+"
+RE_TROOF = r"WIN|FAIL"
+RE_TYPE = r"NOOB|NUMBR|NUMBAR|YARN|TROOF"
+RE_IDENT = r"[A-Za-z][A-Za-z0-9_]*"
+
+
+# builds regex pattern for a keyword joining words with whitespace
+def keyword_regex(lexeme: str) -> str:
+    return _WS.join(re.escape(w) for w in lexeme.split()) + _END
+
+
+# holds compiled regex pattern and its classification info
+class PatternEntry(NamedTuple):
+    pattern: str
+    compiled: "re.Pattern"
+    classification: str
+    subtype: str
+    name: str
+
+
+# compiles all keyword and literal regex patterns in priority order
+def _build_patterns() -> List[PatternEntry]:
+    entries: List[PatternEntry] = []
+
+    # multi-word keywords first, then longer words first
+    flat = [(lex, cls) for cls, lexes in KEYWORD_GROUPS for lex in lexes]
+    flat.sort(key=lambda p: (-len(p[0].split()), -len(p[0])))
+    for lex, cls in flat:
+        src = keyword_regex(lex)
+        entries.append(PatternEntry(src, re.compile(src), cls, "", lex))
+
+    def lit(name, src, cls, sub):
+        full = f"(?:{src})" + _END
+        entries.append(PatternEntry(full, re.compile(full), cls, sub, name))
+
+    # literals in priority order before identifiers
+    lit("TROOF", RE_TROOF, CLASS_LITERAL, "TROOF")
+    lit("TYPE", RE_TYPE, CLASS_TYPE_LITERAL, "TYPE")
+    lit("NUMBAR", RE_NUMBAR, CLASS_LITERAL, "NUMBAR")
+    lit("NUMBR", RE_NUMBR, CLASS_LITERAL, "NUMBR")
+    lit("IDENTIFIER", RE_IDENT, CLASS_VAR_IDENT, "")
+
+    return entries
+
+
+PATTERNS: List[PatternEntry] = _build_patterns()
+
+
+# matches the first valid lexeme starting at a given position in text
+def match_lexeme_at(text: str, pos: int = 0) -> Optional[Tuple[str, str, str, str]]:
+    for entry in PATTERNS:
+        m = entry.compiled.match(text, pos)
+        if m:
+            return (m.group(0), entry.classification, entry.subtype, entry.name)
+    return None
+
+
+# classifies a single whole lexeme string into classification and subtype
+def classify_lexeme(lexeme: str) -> Optional[Tuple[str, str]]:
+    hit = match_lexeme_at(lexeme, 0)
+    if hit and hit[0] == lexeme:
+        return (hit[1], hit[2])
+    return None
+
+
+# tokenizes plain lolcode text without comments and handles lexical errors
+def tokenize_fragment(text: str, line_no: int = 0) -> Tuple[List[Token], List[LexError]]:
+    tokens: List[Token] = []
+    errors: List[LexError] = []
+    pos, n = 0, len(text)
+    prev_kw = ""
+
+    while pos < n:
+        if text[pos].isspace():
+            pos += 1
+            continue
+
+        hit = match_lexeme_at(text, pos)
+        if hit is None:
+            end = pos
+            while end < n and not text[end].isspace():
+                end += 1
+            errors.append(LexError(line_no, text[pos:end], "Unrecognized lexeme"))
+            pos = end
+            prev_kw = ""
+            continue
+
+        lexeme, cls, sub, name = hit
+        # check if identifier is a function or loop name based on previous keyword
+        if name == "IDENTIFIER":
+            if prev_kw in _FUNC_CONTEXT:
+                cls = CLASS_FUNC_IDENT
+            elif prev_kw in _LOOP_CONTEXT:
+                cls = CLASS_LOOP_IDENT
+
+        tokens.append(Token(lexeme, cls, line_no, sub))
+        prev_kw = name if cls not in (CLASS_VAR_IDENT, CLASS_FUNC_IDENT,
+                                      CLASS_LOOP_IDENT, CLASS_LITERAL,
+                                      CLASS_TYPE_LITERAL) else ""
+        pos += len(lexeme)
+
+    return tokens, errors
+
+
+# runs test assertions to verify all lexeme patterns and classifications
+def _self_test() -> None:
+    def kinds(src):
+        toks, errs = tokenize_fragment(src, 1)
+        return [(t.lexeme, t.classification) for t in toks], errs
+
+    # code delimiter
+    assert classify_lexeme("HAI") == ("Code Delimiter", "")
+    assert classify_lexeme("KTHXBYE") == ("Code Delimiter", "")
+    # declaration block delimiter
+    assert classify_lexeme("WAZZUP") == ("Declaration Block Delimiter", "")
+    assert classify_lexeme("BUHBYE") == ("Declaration Block Delimiter", "")
+    # variable declaration
+    assert classify_lexeme("I HAS A") == ("Variable Declaration", "")
+    # variable initialization
+    assert classify_lexeme("ITZ") == ("Variable Initialization", "")
+    # assignment keyword
+    assert classify_lexeme("R") == ("Assignment Keyword", "")
+    # operand separator
+    assert classify_lexeme("AN") == ("Operand Separator", "")
+    # output keyword
+    assert classify_lexeme("VISIBLE") == ("Output Keyword", "")
+    # input keyword
+    assert classify_lexeme("GIMMEH") == ("Input Keyword", "")
+    # concatenation keyword
+    assert classify_lexeme("SMOOSH") == ("Concatenation Keyword", "")
+    # arithmetic operator
+    for kw in ["SUM OF", "DIFF OF", "PRODUKT OF", "QUOSHUNT OF", "MOD OF", "BIGGR OF", "SMALLR OF"]:
+        assert classify_lexeme(kw) == ("Arithmetic Operator", "")
+    # comparison operator
+    assert classify_lexeme("BOTH SAEM") == ("Comparison Operator", "")
+    assert classify_lexeme("DIFFRINT") == ("Comparison Operator", "")
+    # boolean operator
+    for kw in ["BOTH OF", "EITHER OF", "WON OF", "NOT"]:
+        assert classify_lexeme(kw) == ("Boolean Operator", "")
+    # infinite arity operator
+    assert classify_lexeme("ALL OF") == ("Infinite Arity Operator", "")
+    assert classify_lexeme("ANY OF") == ("Infinite Arity Operator", "")
+    # operator delimiter
+    assert classify_lexeme("MKAY") == ("Operator Delimiter", "")
+    # typecast keyword
+    for kw in ["MAEK", "IS NOW A", "A"]:
+        assert classify_lexeme(kw) == ("Typecast Keyword", "")
+    # conditional keyword
+    for kw in ["O RLY?", "YA RLY", "NO WAI", "MEBBE"]:
+        assert classify_lexeme(kw) == ("Conditional Keyword", "")
+    # switch-case keyword
+    for kw in ["WTF?", "OMG", "OMGWTF"]:
+        assert classify_lexeme(kw) == ("Switch-Case Keyword", "")
+    # conditional and switch delimiter
+    assert classify_lexeme("OIC") == ("Conditional/Switch Delimiter", "")
+    # break keyword
+    assert classify_lexeme("GTFO") == ("Break Keyword", "")
+    # loop delimiter
+    assert classify_lexeme("IM IN YR") == ("Loop Delimiter", "")
+    assert classify_lexeme("IM OUTTA YR") == ("Loop Delimiter", "")
+    # loop keyword
+    for kw in ["UPPIN", "NERFIN", "TIL", "WILE"]:
+        assert classify_lexeme(kw) == ("Loop Keyword", "")
+    # function delimiter
+    assert classify_lexeme("HOW IZ I") == ("Function Delimiter", "")
+    assert classify_lexeme("IF U SAY SO") == ("Function Delimiter", "")
+    # return keyword
+    assert classify_lexeme("FOUND YR") == ("Return Keyword", "")
+    # function call keyword
+    assert classify_lexeme("I IZ") == ("Function Call Keyword", "")
+    # parameter keyword
+    assert classify_lexeme("YR") == ("Parameter Keyword", "")
+    assert classify_lexeme("AN YR") == ("Parameter Keyword", "")
+    # comment keyword
+    for kw in ["BTW", "OBTW", "TLDR"]:
+        assert classify_lexeme(kw) == (CLASS_COMMENT, "")
+    # troof literal
+    assert classify_lexeme("WIN") == (CLASS_LITERAL, "TROOF")
+    assert classify_lexeme("FAIL") == (CLASS_LITERAL, "TROOF")
+    # type literal
+    for t_lit in ["NOOB", "NUMBR", "NUMBAR", "YARN", "TROOF"]:
+        assert classify_lexeme(t_lit) == (CLASS_TYPE_LITERAL, "TYPE")
+    # numbar literal
+    for numbar in ["-3.5", "0.0", "42.125"]:
+        assert classify_lexeme(numbar) == (CLASS_LITERAL, "NUMBAR")
+    # numbr literal
+    for numbr in ["-3", "0", "42"]:
+        assert classify_lexeme(numbr) == (CLASS_LITERAL, "NUMBR")
+    # variable identifier
+    assert classify_lexeme("AN_ITEM") == (CLASS_VAR_IDENT, "")
+    assert classify_lexeme("my_var123") == (CLASS_VAR_IDENT, "")
+    # function identifier
+    t, _ = kinds("HOW IZ I add YR x AN YR y")
+    assert t[1] == ("add", CLASS_FUNC_IDENT) and t[3] == ("x", CLASS_VAR_IDENT)
+    # loop identifier
+    t, _ = kinds("IM IN YR loop UPPIN YR i")
+    assert t[1] == ("loop", CLASS_LOOP_IDENT)
+    # invalid literal
+    assert classify_lexeme("+3") is None
+    assert classify_lexeme("1.2.3") is None
+    # lexical error
+    t, e = kinds("VISIBLE 12abc @@")
+    assert len(e) == 2 and e[0].lexeme == "12abc"
+
+    print("lol_lexemes self-test: OK")
+
+
+if __name__ == "__main__":
+    _self_test()
