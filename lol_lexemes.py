@@ -139,7 +139,36 @@ def classify_lexeme(lexeme: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-# tokenizes plain lolcode text without comments and handles lexical errors
+# scans a YARN from opening quote at pos; returns (tokens, errors, new_pos)
+def _scan_yarn(text: str, pos: int, line_no: int) -> Tuple[List[Token], List[LexError], int]:
+    tokens: List[Token] = []
+    errors: List[LexError] = []
+    n = len(text)
+
+    tokens.append(Token('"', CLASS_STRING_DELIMITER, line_no))
+    pos += 1  # consume opening "
+    start = pos
+
+    while pos < n:
+        # LOLCODE escaped quote :\" stays inside the YARN
+        if text[pos] == ":" and pos + 1 < n and text[pos + 1] == '"':
+            pos += 2
+            continue
+        if text[pos] == '"':
+            inner = text[start:pos]
+            tokens.append(Token(inner, CLASS_LITERAL, line_no, "YARN"))
+            tokens.append(Token('"', CLASS_STRING_DELIMITER, line_no))
+            return tokens, errors, pos + 1
+        pos += 1
+
+    # unclosed string — emit whatever content was collected
+    errors.append(LexError(line_no, text[start - 1:], "Unclosed string literal"))
+    if start < n:
+        tokens.append(Token(text[start:], CLASS_LITERAL, line_no, "YARN"))
+    return tokens, errors, n
+
+
+# tokenizes one statement line; indentation/extra spaces are ignored
 def tokenize_fragment(text: str, line_no: int = 0) -> Tuple[List[Token], List[LexError]]:
     tokens: List[Token] = []
     errors: List[LexError] = []
@@ -147,8 +176,17 @@ def tokenize_fragment(text: str, line_no: int = 0) -> Tuple[List[Token], List[Le
     prev_kw = ""
 
     while pos < n:
+        # spaces and tabs only separate lexemes; indentation is irrelevant
         if text[pos].isspace():
             pos += 1
+            continue
+
+        # YARN first: retain internal spaces; do not whitespace-split inside quotes
+        if text[pos] == '"':
+            yarn_toks, yarn_errs, pos = _scan_yarn(text, pos, line_no)
+            tokens.extend(yarn_toks)
+            errors.extend(yarn_errs)
+            prev_kw = ""
             continue
 
         hit = match_lexeme_at(text, pos)
@@ -170,12 +208,123 @@ def tokenize_fragment(text: str, line_no: int = 0) -> Tuple[List[Token], List[Le
                 cls = CLASS_LOOP_IDENT
 
         tokens.append(Token(lexeme, cls, line_no, sub))
+        # BTW starts a single-line comment: keep the keyword, strip the rest
+        if name == "BTW":
+            break
         prev_kw = name if cls not in (CLASS_VAR_IDENT, CLASS_FUNC_IDENT,
                                       CLASS_LOOP_IDENT, CLASS_LITERAL,
                                       CLASS_TYPE_LITERAL) else ""
         pos += len(lexeme)
 
     return tokens, errors
+
+
+# true when the line's only lexeme is the given comment keyword (ignoring indent)
+def _line_is_only_comment_keyword(line: str, keyword: str) -> bool:
+    toks, errs = tokenize_fragment(line, 0)
+    return not errs and len(toks) == 1 and toks[0].lexeme == keyword
+
+
+# line-by-line scanner with BTW / OBTW ... TLDR comment handling
+def tokenize_source(source: str) -> Tuple[List[Token], List[LexError]]:
+    tokens: List[Token] = []
+    errors: List[LexError] = []
+    in_obtw = False
+    obtw_line = 0
+
+    # splitlines handles \n, \r\n, and \r; blank lines yield no tokens
+    for line_no, line in enumerate(source.splitlines(), start=1):
+        stripped = line.strip()
+
+        # inside OBTW ... TLDR: skip body until a lone TLDR closes the block
+        if in_obtw:
+            if not stripped:
+                continue
+            hit = match_lexeme_at(stripped, 0)
+            if hit and hit[3] == "TLDR":
+                rest = stripped[len(hit[0]):].strip()
+                if rest == "":
+                    tokens.append(Token("TLDR", CLASS_COMMENT, line_no))
+                    in_obtw = False
+                else:
+                    errors.append(LexError(
+                        line_no, stripped,
+                        "TLDR must occupy its own line and cannot coexist with other statements",
+                    ))
+            elif re.search(r"(?<![A-Za-z0-9_])TLDR(?![A-Za-z0-9_])", stripped):
+                # TLDR appears mid-line with other text
+                errors.append(LexError(
+                    line_no, stripped,
+                    "TLDR must occupy its own line and cannot coexist with other statements",
+                ))
+            # otherwise this line is comment body — ignore entirely
+            continue
+
+        if not stripped:
+            continue
+
+        # OBTW must be alone on its line; then enter multi-line comment state
+        if _line_is_only_comment_keyword(line, "OBTW"):
+            tokens.append(Token("OBTW", CLASS_COMMENT, line_no))
+            in_obtw = True
+            obtw_line = line_no
+            continue
+
+        # TLDR outside an OBTW block is invalid
+        if _line_is_only_comment_keyword(line, "TLDR"):
+            errors.append(LexError(
+                line_no, "TLDR", "TLDR without matching OBTW",
+            ))
+            continue
+
+        line_tokens, line_errors = tokenize_fragment(line, line_no)
+
+        # reject OBTW/TLDR sharing a line with any other statement
+        for t in line_tokens:
+            if t.lexeme == "OBTW":
+                errors.append(LexError(
+                    line_no, line.strip(),
+                    "OBTW must occupy its own line and cannot coexist with other statements",
+                ))
+                line_tokens = []
+                line_errors = []
+                break
+            if t.lexeme == "TLDR":
+                errors.append(LexError(
+                    line_no, line.strip(),
+                    "TLDR must occupy its own line and cannot coexist with other statements",
+                ))
+                line_tokens = []
+                line_errors = []
+                break
+
+        tokens.extend(line_tokens)
+        errors.extend(line_errors)
+
+    if in_obtw:
+        errors.append(LexError(
+            obtw_line, "OBTW", "Unclosed multi-line comment (missing TLDR)",
+        ))
+
+    return tokens, errors
+
+
+# reads a .lol file and runs the line-by-line scanner over its contents
+def tokenize_file(path: str) -> Tuple[List[Token], List[LexError]]:
+    with open(path, encoding="utf-8") as f:
+        return tokenize_source(f.read())
+
+
+# prints a simple lexeme table for presentation / CLI use
+def print_lexeme_table(tokens: List[Token], errors: Optional[List[LexError]] = None) -> None:
+    print(f"{'Line':<6}{'Lexeme':<30}Classification")
+    print("-" * 60)
+    for t in tokens:
+        print(f"{t.line:<6}{t.lexeme:<30}{t.classification}")
+    if errors:
+        print()
+        for e in errors:
+            print(e, file=sys.stderr)
 
 
 # runs test assertions to verify all lexeme patterns and classifications
@@ -278,8 +427,131 @@ def _self_test() -> None:
     t, e = kinds("VISIBLE 12abc @@")
     assert len(e) == 2 and e[0].lexeme == "12abc"
 
+    # line-by-line scanner: newlines delimit statements; indentation ignored
+    program = (
+        "HAI 1.2\n"
+        "    WAZZUP\n"
+        "        I HAS A x ITZ 10\n"
+        "    BUHBYE\n"
+        "\n"
+        "    VISIBLE x\n"
+        "KTHXBYE\n"
+    )
+    toks, errs = tokenize_source(program)
+    assert errs == []
+    assert [t.line for t in toks] == [1, 1, 2, 3, 3, 3, 3, 4, 6, 6, 7]
+    assert toks[0] == Token("HAI", "Code Delimiter", 1)
+    assert toks[2] == Token("WAZZUP", "Declaration Block Delimiter", 2)
+    assert toks[3].lexeme == "I HAS A" and toks[3].line == 3
+    assert toks[5] == Token("ITZ", "Variable Initialization", 3)
+    assert toks[6] == Token("10", CLASS_LITERAL, 3, "NUMBR")
+    assert toks[8] == Token("VISIBLE", "Output Keyword", 6)
+    assert toks[-1] == Token("KTHXBYE", "Code Delimiter", 7)
+    # indented blank-separated lines still produce correct classifications
+    assert [(t.lexeme, t.classification) for t in toks] == [
+        ("HAI", "Code Delimiter"),
+        ("1.2", CLASS_LITERAL),
+        ("WAZZUP", "Declaration Block Delimiter"),
+        ("I HAS A", "Variable Declaration"),
+        ("x", CLASS_VAR_IDENT),
+        ("ITZ", "Variable Initialization"),
+        ("10", CLASS_LITERAL),
+        ("BUHBYE", "Declaration Block Delimiter"),
+        ("VISIBLE", "Output Keyword"),
+        ("x", CLASS_VAR_IDENT),
+        ("KTHXBYE", "Code Delimiter"),
+    ]
+    # errors keep the originating line number across the file
+    bad = "HAI\nVISIBLE 12abc\nKTHXBYE\n"
+    _, bad_errs = tokenize_source(bad)
+    assert len(bad_errs) == 1 and bad_errs[0].line == 2 and bad_errs[0].lexeme == "12abc"
+
+    # BTW: keep preceding statement; strip comment body after BTW
+    btw = "VISIBLE x BTW this is ignored @@ junk\nKTHXBYE\n"
+    toks, errs = tokenize_source(btw)
+    assert errs == []
+    assert [(t.lexeme, t.classification) for t in toks] == [
+        ("VISIBLE", "Output Keyword"),
+        ("x", CLASS_VAR_IDENT),
+        ("BTW", CLASS_COMMENT),
+        ("KTHXBYE", "Code Delimiter"),
+    ]
+    # BTW alone on a line still emits the keyword only
+    toks, errs = tokenize_source("BTW just a comment\n")
+    assert errs == [] and toks == [Token("BTW", CLASS_COMMENT, 1)]
+
+    # OBTW ... TLDR: own lines; body is not tokenized
+    obtw = (
+        "HAI\n"
+        "OBTW\n"
+        "    this is a multi-line comment\n"
+        "    VISIBLE should_not_appear\n"
+        "TLDR\n"
+        "VISIBLE x\n"
+        "KTHXBYE\n"
+    )
+    toks, errs = tokenize_source(obtw)
+    assert errs == []
+    assert [(t.lexeme, t.classification, t.line) for t in toks] == [
+        ("HAI", "Code Delimiter", 1),
+        ("OBTW", CLASS_COMMENT, 2),
+        ("TLDR", CLASS_COMMENT, 5),
+        ("VISIBLE", "Output Keyword", 6),
+        ("x", CLASS_VAR_IDENT, 6),
+        ("KTHXBYE", "Code Delimiter", 7),
+    ]
+    # OBTW cannot share a line with other statements
+    _, errs = tokenize_source("OBTW trailing text\nTLDR\n")
+    assert any("OBTW must occupy its own line" in e.message for e in errs)
+    _, errs = tokenize_source("VISIBLE OBTW\n")
+    assert any("OBTW must occupy its own line" in e.message for e in errs)
+    # TLDR cannot share a line with other statements
+    _, errs = tokenize_source("OBTW\nTLDR trailing\n")
+    assert any("TLDR must occupy its own line" in e.message for e in errs)
+    # TLDR without OBTW
+    _, errs = tokenize_source("TLDR\n")
+    assert any("TLDR without matching OBTW" in e.message for e in errs)
+    # unclosed OBTW
+    _, errs = tokenize_source("OBTW\nstill commenting\n")
+    assert any("Unclosed multi-line comment" in e.message for e in errs)
+
+    # YARN: quotes are String Delimiter; inner text is Literal (spaces kept)
+    t, e = kinds('VISIBLE "Hai world!"')
+    assert e == []
+    assert t == [
+        ("VISIBLE", "Output Keyword"),
+        ('"', CLASS_STRING_DELIMITER),
+        ("Hai world!", CLASS_LITERAL),
+        ('"', CLASS_STRING_DELIMITER),
+    ]
+    yarn_toks, _ = tokenize_fragment('"Hai world!"', 1)
+    assert yarn_toks[1].subtype == "YARN"
+    # empty YARN
+    t, e = kinds('""')
+    assert e == [] and t == [
+        ('"', CLASS_STRING_DELIMITER),
+        ("", CLASS_LITERAL),
+        ('"', CLASS_STRING_DELIMITER),
+    ]
+    # escaped quote :\" stays inside the literal
+    t, e = kinds('"say :"hi:""')
+    assert e == []
+    assert t[1] == ('say :"hi:"', CLASS_LITERAL)
+    # BTW inside a YARN is not a comment
+    toks, errs = tokenize_source('VISIBLE "BTW not a comment"\n')
+    assert errs == []
+    assert [x.lexeme for x in toks] == ["VISIBLE", '"', "BTW not a comment", '"']
+    # unclosed YARN
+    _, e = kinds('VISIBLE "oops')
+    assert any("Unclosed string literal" in err.message for err in e)
+
     print("lol_lexemes self-test: OK")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        toks, errs = tokenize_file(path)
+        print_lexeme_table(toks, errs)
+        sys.exit(1 if errs else 0)
     _self_test()
