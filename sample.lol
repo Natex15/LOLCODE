@@ -1,0 +1,7 @@
+HAI 1.2
+    WAZZUP
+        I HAS A x ITZ 10
+    BUHBYE
+
+    VISIBLE x
+KTHXBYE

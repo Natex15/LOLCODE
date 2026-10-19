@@ -59,3 +59,5 @@
 | `NUMBAR` | `(?:-?[0-9]+\.[0-9]+)(?=\s\|$)` | Literal |
 | `NUMBR` | `(?:-?[0-9]+)(?=\s\|$)` | Literal |
 | `IDENTIFIER` | `(?:[A-Za-z][A-Za-z0-9_]*)(?=\s\|$)` | Variable Identifier |
+| `"` (open/close) | scanned before whitespace split; `:"` escapes a quote | String Delimiter |
+| YARN content | characters between matching `"` (spaces kept) | Literal |
