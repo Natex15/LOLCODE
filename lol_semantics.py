@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 References:
-  [LOL1.2] https://github.com/justinmeza/lolcode-spec/blob/master/v1.2/lolcode-spec-v1.2.md
   [CI-11] https://craftinginterpreters.com/resolving-and-binding.html
   [CI-6] https://craftinginterpreters.com/parsing-expressions.html
   [CORNELL] https://www.cs.cornell.edu/courses/cs4120/2022sp/notes/semantic/
