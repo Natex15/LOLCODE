@@ -1,9 +1,25 @@
+#!/usr/bin/env python3
+"""
+References:
+  [CI-4] https://craftinginterpreters.com/scanning.html
+  [CORNELL-LEX] https://www.cs.cornell.edu/courses/cs4120/2022sp/notes/lex/
+  [WIKI-LEX] https://en.wikipedia.org/wiki/Lexical_analysis
+  [WIKIBK-LEX] https://en.wikibooks.org/wiki/Compiler_Construction/Lexical_analysis
+  [UC3M-LEX] https://ocw.uc3m.es/pluginfile.php/1845/mod_page/content/12/contents_unit4.pdf
+  [PY-RE] https://docs.python.org/3/library/re.html
+  [TUT-LOL] https://www.tutorialspoint.com/lolcode/index.htm
+  [ESOLANG] https://esolangs.org/wiki/LOLCODE
+  [LOL-ORG] https://lolcode.org/
+  [OWN] from own module
+===================================================================================
+"""
 import re
 import sys
 from typing import List, NamedTuple, Optional, Tuple
 
 
 # represents a single token with its lexeme, classification, line number, and subtype
+# Sources: [CI-4] 4.2 (token structure, type, and source position), [WIKI-LEX] (tokens vs lexemes).
 class Token(NamedTuple):
     lexeme: str
     classification: str
@@ -16,6 +32,7 @@ class Token(NamedTuple):
 
 
 # stores information about a lexical error
+# Sources: [CI-4] 4.1.2 (lexical error reporting), [CORNELL-LEX] (lexical error diagnostics).
 class LexError(NamedTuple):
     line: int
     lexeme: str
@@ -26,6 +43,7 @@ class LexError(NamedTuple):
 
 
 # classification names shared across members
+# Sources: [TUT-LOL] (syntax keywords and classification groups), [ESOLANG] (core token vocabulary).
 CLASS_STRING_DELIMITER = "String Delimiter"
 CLASS_LITERAL = "Literal"
 CLASS_TYPE_LITERAL = "Type Literal"
@@ -81,6 +99,7 @@ RE_IDENT = r"[A-Za-z][A-Za-z0-9_]*"
 
 
 # builds regex pattern for a keyword joining words with whitespace
+# Sources: [PY-RE] (re.escape and regex syntax), [TUT-LOL] (multi-word keywords with arbitrary spacing).
 def keyword_regex(lexeme: str) -> str:
     return _WS.join(re.escape(w) for w in lexeme.split()) + _END
 
@@ -95,6 +114,7 @@ class PatternEntry(NamedTuple):
 
 
 # compiles all keyword and literal regex patterns in priority order
+# Sources: [CORNELL-LEX] (maximal munch / token precedence), [CI-4] 4.4 (literal and keyword matching priority).
 def _build_patterns() -> List[PatternEntry]:
     entries: List[PatternEntry] = []
 
@@ -123,6 +143,7 @@ PATTERNS: List[PatternEntry] = _build_patterns()
 
 
 # matches the first valid lexeme starting at a given position in text
+# Sources: [WIKIBK-LEX] (pattern priority ordering), [PY-RE] (compiled regex matching).
 def match_lexeme_at(text: str, pos: int = 0) -> Optional[Tuple[str, str, str, str]]:
     for entry in PATTERNS:
         m = entry.compiled.match(text, pos)
@@ -132,6 +153,7 @@ def match_lexeme_at(text: str, pos: int = 0) -> Optional[Tuple[str, str, str, st
 
 
 # classifies a single whole lexeme string into classification and subtype
+# Sources: [WIKI-LEX] (lexeme classification against grammar terminals).
 def classify_lexeme(lexeme: str) -> Optional[Tuple[str, str]]:
     hit = match_lexeme_at(lexeme, 0)
     if hit and hit[0] == lexeme:
@@ -140,6 +162,7 @@ def classify_lexeme(lexeme: str) -> Optional[Tuple[str, str]]:
 
 
 # scans a YARN from opening quote at pos; returns (tokens, errors, new_pos)
+# Sources: [CI-4] 4.5.1 (string literal scanning & unclosed string reporting), [TUT-LOL] (string literals and quote escapes).
 def _scan_yarn(text: str, pos: int, line_no: int) -> Tuple[List[Token], List[LexError], int]:
     tokens: List[Token] = []
     errors: List[LexError] = []
@@ -169,6 +192,7 @@ def _scan_yarn(text: str, pos: int, line_no: int) -> Tuple[List[Token], List[Lex
 
 
 # tokenizes one statement line; indentation/extra spaces are ignored
+# Sources: [CI-4] 4.3 (character-by-character scanning loop), [CORNELL-LEX] (contextual identifier vs keyword disambiguation).
 def tokenize_fragment(text: str, line_no: int = 0) -> Tuple[List[Token], List[LexError]]:
     tokens: List[Token] = []
     errors: List[LexError] = []
@@ -226,6 +250,7 @@ def _line_is_only_comment_keyword(line: str, keyword: str) -> bool:
 
 
 # line-by-line scanner with BTW / OBTW ... TLDR comment handling
+# Sources: [CI-4] 4.4 (comment stripping in lexical analysis), [TUT-LOL] (BTW inline and OBTW/TLDR block comments).
 def tokenize_source(source: str) -> Tuple[List[Token], List[LexError]]:
     tokens: List[Token] = []
     errors: List[LexError] = []
@@ -310,12 +335,14 @@ def tokenize_source(source: str) -> Tuple[List[Token], List[LexError]]:
 
 
 # reads a .lol file and runs the line-by-line scanner over its contents
+# Sources: [CI-4] 4.1.1 (file loading and string scanning).
 def tokenize_file(path: str) -> Tuple[List[Token], List[LexError]]:
     with open(path, encoding="utf-8") as f:
         return tokenize_source(f.read())
 
 
 # prints a simple lexeme table for presentation / CLI use
+# Sources: [WIKI-LEX] (tabular visualization of lexemes and token categories).
 def print_lexeme_table(tokens: List[Token], errors: Optional[List[LexError]] = None) -> None:
     print(f"{'Line':<6}{'Lexeme':<30}Classification")
     print("-" * 60)
@@ -328,6 +355,7 @@ def print_lexeme_table(tokens: List[Token], errors: Optional[List[LexError]] = N
 
 
 # runs test assertions to verify all lexeme patterns and classifications
+# Sources: [CI-4] (lexer test coverage), [TUT-LOL] (syntax examples and test cases).
 def _self_test() -> None:
     def kinds(src):
         toks, errs = tokenize_fragment(src, 1)
