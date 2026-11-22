@@ -224,6 +224,7 @@ class SemanticAnalyzer:
         self.it_set = False
         self._saved_it_set = False
         self._func_ranges: Dict[str, Tuple[int, int]] = {}
+        self._func_line_ranges: List[Tuple[int, int]] = []
         self._call_depth = 0
         self.seen_hai = self.seen_kthxbye = self.seen_wazzup = False
         self.hai_line: Optional[int] = None
@@ -515,6 +516,8 @@ class SemanticAnalyzer:
             if v.type == TROOF and v.const is not None:
                 return 1.0 if v.const else 0.0
             if v.type == YARN and v.const is not None:
+                if not re.fullmatch(r"-?[0-9]+(\.[0-9]+)?", v.const):
+                    return None
                 return float(v.const)
         except (TypeError, ValueError):
             pass
@@ -575,17 +578,20 @@ class SemanticAnalyzer:
         top = self.frames[-1]
 
         # ---- program-frame phase checks ([PROJ] FILE NAMING, VARIABLES; phase machine is [OWN])
-        if self.phase == "PRE" and k != "HAI":
-            if not self.pre_reported:
-                self.err(line, "program must start with HAI (nothing is allowed before HAI)")
-                self.pre_reported = True
-            self.phase = "BODY"
-        elif self.phase == "POST":
-            self.err(line, "nothing is allowed after KTHXBYE")
-            return
-        elif not self.in_function and self.phase == "DECL" and k not in ("I HAS A", "BUHBYE", "HOW IZ I"):
-            self.err(line, "only variable declarations (I HAS A) are allowed inside WAZZUP ... BUHBYE")
-        if self.phase == "BODY" and k not in ("HAI", "WAZZUP", "BUHBYE", "KTHXBYE"):
+        if not self.in_function and k not in ("HOW IZ I", "IF U SAY SO"):
+            if self.phase == "PRE" and k != "HAI":
+                if not self.pre_reported:
+                    self.err(line, "program must start with HAI (only functions may precede it)")
+                    self.pre_reported = True
+                self.phase = "BODY"
+            elif self.phase == "POST":
+                self.err(line, "only functions are allowed after KTHXBYE")
+                return
+            elif self.phase == "DECL" and k not in ("I HAS A", "BUHBYE"):
+                self.err(line, "only variable declarations (I HAS A) are allowed inside WAZZUP ... BUHBYE")
+            if self.phase == "BODY" and k not in ("HAI", "WAZZUP", "BUHBYE", "KTHXBYE"):
+                self.body_started = True
+        elif not self.in_function and k == "HOW IZ I" and self.phase == "BODY":
             self.body_started = True
 
         # ---- block-shape checks ([PROJ] IF-THEN / SWITCH-CASE; unreachable code: [CI-11] 11.5)
@@ -705,8 +711,6 @@ class SemanticAnalyzer:
             self.kthxbye_line = line
         if self.phase == "DECL":
             self.err(line, "WAZZUP block was never closed with BUHBYE")
-        if self.seen_hai and not self.body_started:
-            self.err(line, "program must contain at least one statement (<code_block> is mandatory)")
         for f in self.frames[1:]:
             self.err(f.line, f"{self._open_name(f)} opened here is never closed")
         self.frames = self.frames[:1]
@@ -1054,7 +1058,8 @@ class SemanticAnalyzer:
         while self.frames[-1].kind != "FUNC":
             f = self.frames.pop()
             self.err(f.line, f"{self._open_name(f)} opened here is not closed before the function ends")
-        self.frames.pop()
+        fn_frame = self.frames.pop()
+        self._func_line_ranges.append((fn_frame.line, line))
         for s in self.scope.values():
             if s.name != "IT" and not s.used and not s.is_param:
                 self.warn(s.line, f"local variable '{s.name}' is declared but never used")
@@ -1068,6 +1073,12 @@ class SemanticAnalyzer:
         return {"IF": "O RLY?", "SWITCH": "WTF?", "LOOP": f"loop '{f.label}'",
                 "FUNC": f"function '{f.label}'"}.get(f.kind, f.kind)
 
+    def _line_in_func(self, line: int) -> bool:
+        """True if `line` falls inside a function definition (closed or still open)."""
+        if any(s <= line <= e for s, e in self._func_line_ranges):
+            return True
+        return any(f.kind == "FUNC" and f.line <= line for f in self.frames[1:])
+
     def _finish(self) -> None:
         """End-of-file checks: HAI/KTHXBYE present, nothing left open, unused globals.
         Sources: [PROJ] FILE NAMING, [GRAM] program, [CI-11] 11.5 (warn on a variable that is never
@@ -1077,21 +1088,19 @@ class SemanticAnalyzer:
             return
         if self.hai_line is not None and not self.pre_reported:
             for c in self.comment_tokens:
-                if c.line < self.hai_line:
-                    self.err(c.line, "program must start with HAI (nothing is allowed before HAI)")
+                if c.line < self.hai_line and not self._line_in_func(c.line):
+                    self.err(c.line, "program must start with HAI (only functions may precede it)")
                     self.pre_reported = True
                     break
         if self.kthxbye_line is not None:
             for c in self.comment_tokens:
-                if c.line > self.kthxbye_line:
-                    self.err(c.line, "nothing is allowed after KTHXBYE")
+                if c.line > self.kthxbye_line and not self._line_in_func(c.line):
+                    self.err(c.line, "only functions are allowed after KTHXBYE")
                     break
         if not self.seen_hai:
             self.err(self.first_line, "missing HAI")
         if not self.seen_kthxbye:
             self.err(self.last_line, "missing KTHXBYE")
-            if self.seen_hai and not self.body_started:
-                self.err(self.last_line, "program must contain at least one statement (<code_block> is mandatory)")
         if self.phase == "DECL" and not self.seen_kthxbye:
             self.err(self.last_line, "WAZZUP block was never closed with BUHBYE")
         for f in self.frames[1:]:
@@ -1707,10 +1716,14 @@ def _self_test() -> None:
     assert has(run("VISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
     assert has(run("BTW comment before HAI\nHAI\nVISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
     assert has(run("HAI\nVISIBLE 1\nKTHXBYE\nBTW comment after KTHXBYE\n")[0], "after KTHXBYE")
-    assert has(run("HOW IZ I f\n  VISIBLE 1\nIF U SAY SO\nHAI\nVISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
-    assert has(run("HAI\nVISIBLE 1\nKTHXBYE\nHOW IZ I f\n  VISIBLE 1\nIF U SAY SO\n")[0], "after KTHXBYE")
-    assert has(run("HAI\nKTHXBYE\n")[0], "<code_block> is mandatory")
-    assert has(run("HAI\nWAZZUP\n  I HAS A x ITZ 1\nBUHBYE\nKTHXBYE\n")[0], "<code_block> is mandatory")
+    assert not run("HOW IZ I f\n  BTW inside func\n  VISIBLE 1\nIF U SAY SO\nHAI\n  I IZ f MKAY\nKTHXBYE\n")[0]
+    assert not run("HAI\n  I IZ f MKAY\nKTHXBYE\nHOW IZ I f\n  BTW inside func\n  VISIBLE 1\nIF U SAY SO\n")[0]
+    assert has(run("HAI\n  VISIBLE 1\nKTHXBYE\nHOW IZ I f\n  VISIBLE 1\nIF U SAY SO\nVISIBLE 2\n")[0], "after KTHXBYE")
+    assert not run("HAI\nKTHXBYE\n")[0]
+    assert not run("HAI 1.2\nKTHXBYE\n")[0]
+    assert not run("HAI\nWAZZUP\nBUHBYE\nKTHXBYE\n")[0]
+    assert not run("HAI\nWAZZUP\n  I HAS A x ITZ 1\nBUHBYE\nKTHXBYE\n")[0]
+    assert has(run("")[0], "empty program")
     assert not run("HAI BTW inline comment\nVISIBLE 1 + 2 BTW inline comment\nKTHXBYE BTW inline comment\n")[0]
     assert has(run("HAI\nVISIBLE \"a\" \"b\"\nKTHXBYE\n")[0], "separated by '+'")
     assert has(run("HAI\nVISIBLE \"a\" AN \"b\"\nKTHXBYE\n")[0], "separated by '+'")
@@ -1718,6 +1731,12 @@ def _self_test() -> None:
     assert has(run("HAI\nWAZZUP\nI HAS A n\nBUHBYE\nVISIBLE SUM OF n AN 1\nKTHXBYE\n")[0], "NOOB")
     assert not run("HAI\nVISIBLE SUM OF \"2\" AN \"7\"\nKTHXBYE\n")[0]
     assert has(run("HAI\nVISIBLE QUOSHUNT OF 5 AN 0\nKTHXBYE\n")[0], "division by constant zero")
+    assert has(run("HAI\nVISIBLE MOD OF 5 AN 0\nKTHXBYE\n")[0], "division by constant zero")
+    assert has(run("HAI\nWAZZUP\n  I HAS A z ITZ 0\nBUHBYE\nVISIBLE QUOSHUNT OF 5 AN z\nKTHXBYE\n")[0], "division by zero")
+    assert has(run("HAI\nWAZZUP\n  I HAS A z ITZ 0\nBUHBYE\nVISIBLE MOD OF 5 AN z\nKTHXBYE\n")[0], "division by zero")
+    assert has(run("HAI\nVISIBLE QUOSHUNT OF 5 AN DIFF OF 3 AN 3\nKTHXBYE\n")[0], "division by zero")
+    e_bad_yarn, _ = run("HAI\nVISIBLE QUOSHUNT OF 5 AN \"0e5\"\nKTHXBYE\n")
+    assert len(e_bad_yarn) == 1 and "cannot be cast" in e_bad_yarn[0].message
     assert has(run("HAI\nVISIBLE ALL OF WIN AN ANY OF WIN AN FAIL MKAY MKAY\nKTHXBYE\n")[0], "cannot be nested")
     assert has(run("HAI\nVISIBLE BOTH OF WIN AN ALL OF WIN AN FAIL MKAY\nKTHXBYE\n")[0], "cannot be nested")
     assert has(run("HAI\nVISIBLE ALL OF WIN AN FAIL\nKTHXBYE\n")[0], "MKAY")
