@@ -197,13 +197,15 @@ class SemanticAnalyzer:
     def __init__(self, tokens: List[Token],
                  input_fn: Callable[[], str] = input,
                  output_fn: Callable[[str], None] = print,
-                 on_statement: Optional[Callable[["SemanticAnalyzer"], None]] = None): 
+                 on_statement: Optional[Callable[["SemanticAnalyzer"], None]] = None):
         """Group tokens by source line and drop comments.
         Sources: [PROJ] SPACING ('each statement is delimited by the new line') and COMMENTS
         (comments are ignored), [TUT-LOL] Syntax & Spacing (newline ends a command), [LEX] Token.line."""
         self.lines: List[Tuple[int, List[Token]]] = []
+        self.comment_tokens: List[Token] = []
         for t in tokens:
             if t.classification == CLASS_COMMENT:
+                self.comment_tokens.append(t)
                 continue
             if self.lines and self.lines[-1][0] == t.line:
                 self.lines[-1][1].append(t)
@@ -228,6 +230,8 @@ class SemanticAnalyzer:
         self._func_ranges: Dict[str, Tuple[int, int]] = {}
         self._call_depth = 0
         self.seen_hai = self.seen_kthxbye = self.seen_wazzup = False
+        self.hai_line: Optional[int] = None
+        self.kthxbye_line: Optional[int] = None
         self.body_started = self.pre_reported = False
         self.first_line = self.lines[0][0] if self.lines else 1
         self.last_line = self.lines[-1][0] if self.lines else 1
@@ -454,10 +458,16 @@ class SemanticAnalyzer:
         no MKAY; ALL OF / ANY OF need MKAY -- [TUT-LOL] would also let end-of-line close them,
         [PROJ] is stricter), [GRAM] expr_list."""
         vals = [self._expr(cur, line, nested=True)]
+        if not cur.match("AN"):
+            raise SyntaxProblem(f"{op} requires at least two operands separated by 'AN'")
+        vals.append(self._expr(cur, line, nested=True))
         while cur.match("AN"):
             vals.append(self._expr(cur, line, nested=True))
-        if need_mkay and not cur.match("MKAY"):
-            raise SyntaxProblem(f"{op} must be closed with MKAY")
+        if need_mkay:
+            if not cur.match("MKAY"):
+                raise SyntaxProblem(f"{op} must be closed with MKAY")
+        else:
+            cur.match("MKAY")
         return vals
 
     def _num_kind(self, v: Val, op: str, line: int) -> str:
@@ -544,10 +554,10 @@ class SemanticAnalyzer:
         name = cur.expect_class(CLASS_FUNC_IDENT, "a function name after I IZ").lexeme
         argc = 0
         if cur.match("YR"):
-            self._expr(cur, line)
+            self._expr(cur, line, nested=True)
             argc = 1
             while cur.match("AN YR"):
-                self._expr(cur, line)
+                self._expr(cur, line, nested=True)
                 argc += 1
         if not cur.match("MKAY"):
             raise SyntaxProblem(f"call to '{name}' must be closed with MKAY")
@@ -569,19 +579,18 @@ class SemanticAnalyzer:
         top = self.frames[-1]
 
         # ---- program-frame phase checks ([PROJ] FILE NAMING, VARIABLES; phase machine is [OWN])
-        if not self.in_function and k not in ("HOW IZ I", "IF U SAY SO"):
-            if self.phase == "PRE" and k != "HAI":
-                if not self.pre_reported:
-                    self.err(line, "program must start with HAI (only comments or functions may precede it)")
-                    self.pre_reported = True
-                self.phase = "BODY"
-            elif self.phase == "POST":
-                self.err(line, "nothing but comments or functions may follow KTHXBYE")
-                return
-            elif self.phase == "DECL" and k not in ("I HAS A", "BUHBYE"):
-                self.err(line, "only variable declarations (I HAS A) are allowed inside WAZZUP ... BUHBYE")
-            if self.phase == "BODY" and k not in ("HAI", "WAZZUP"):
-                self.body_started = True
+        if self.phase == "PRE" and k != "HAI":
+            if not self.pre_reported:
+                self.err(line, "program must start with HAI (nothing is allowed before HAI)")
+                self.pre_reported = True
+            self.phase = "BODY"
+        elif self.phase == "POST":
+            self.err(line, "nothing is allowed after KTHXBYE")
+            return
+        elif not self.in_function and self.phase == "DECL" and k not in ("I HAS A", "BUHBYE", "HOW IZ I"):
+            self.err(line, "only variable declarations (I HAS A) are allowed inside WAZZUP ... BUHBYE")
+        if self.phase == "BODY" and k not in ("HAI", "WAZZUP", "BUHBYE", "KTHXBYE"):
+            self.body_started = True
 
         # ---- block-shape checks ([PROJ] IF-THEN / SWITCH-CASE; unreachable code: [CI-11] 11.5)
         if k not in STRUCTURAL:
@@ -604,12 +613,13 @@ class SemanticAnalyzer:
             return self._buhbye(cur, line)
         if k == "I HAS A":
             return self._declare(cur, line)
-        if k == "VISIBLE": #https://www.tutorialspoint.com/lolcode/lolcode_syntax.htm   Based on this a space as concat in strings is ok
+        if k == "VISIBLE":
             cur.next()
             self._expr(cur, line)
-            while not cur.at_end():
-                cur.match("AN")  # tolerated; [GRAM] print_args has no separator, [TUT-LOL] allows optional AN
+            while cur.match("+"):
                 self._expr(cur, line)
+            if not cur.at_end():
+                raise SyntaxProblem(f"VISIBLE operands must be separated by '+', found {cur.peek().lexeme!r}")
             return
         if k == "GIMMEH":
             cur.next()
@@ -676,9 +686,11 @@ class SemanticAnalyzer:
             self.err(line, "HAI cannot appear inside a function")
         elif self.seen_hai:
             self.err(line, "duplicate HAI")
-        self.seen_hai = True
-        if self.phase == "PRE":
+        else:
+            self.hai_line = line
             self.phase = "BODY"
+            self.body_started = False
+        self.seen_hai = True
         t = cur.peek()
         if t is not None and t.classification == CLASS_LITERAL and t.subtype in ("NUMBR", "NUMBAR"):
             cur.next()
@@ -693,8 +705,12 @@ class SemanticAnalyzer:
             return
         if self.seen_kthxbye:
             self.err(line, "duplicate KTHXBYE")
+        else:
+            self.kthxbye_line = line
         if self.phase == "DECL":
             self.err(line, "WAZZUP block was never closed with BUHBYE")
+        if self.seen_hai and not self.body_started:
+            self.err(line, "program must contain at least one statement (<code_block> is mandatory)")
         for f in self.frames[1:]:
             self.err(f.line, f"{self._open_name(f)} opened here is never closed")
         self.frames = self.frames[:1]
@@ -729,12 +745,13 @@ class SemanticAnalyzer:
         be a literal, variable or expression; uninitialized = NOOB), [GRAM] declaration,
         [CI-11] 11.3.2 (declare the name first, evaluate the initializer, then mark it defined)
         and 11.5 ('Already a variable with this name in this scope'), [CORNELL] (insert into
-        the symbol table on declaration). Local declarations inside functions are allowed: [OWN]
-        ([PROJ] only mentions WAZZUP for the main program)."""
+        the symbol table on declaration)."""
         cur.next()
         name = cur.expect_class(CLASS_VAR_IDENT, "a variable name after I HAS A").lexeme
         sym: Optional[Symbol] = None
-        if name == "IT":
+        if self.phase != "DECL":
+            self.err(line, f"variable '{name}' must be declared inside the WAZZUP ... BUHBYE block")
+        elif name == "IT":
             self.err(line, "IT is the implicit variable and cannot be declared")
         elif name in self.scope:
             self.err(line, f"variable '{name}' is already declared on line {self.scope[name].line}")
@@ -744,8 +761,6 @@ class SemanticAnalyzer:
             sym = Symbol(name, NOOB, line, False)
             sym.ready = False                  # declared, not yet defined  [CI-11] 11.3.2
             self.scope[name] = sym
-        if not self.in_function and self.phase != "DECL":
-            self.err(line, f"variable '{name}' must be declared inside the WAZZUP ... BUHBYE block")
         val: Optional[Val] = None
         try:
             if cur.match("ITZ"):
@@ -1064,10 +1079,23 @@ class SemanticAnalyzer:
         if not self.lines:
             self.err(1, "empty program: expected HAI ... KTHXBYE")
             return
+        if self.hai_line is not None and not self.pre_reported:
+            for c in self.comment_tokens:
+                if c.line < self.hai_line:
+                    self.err(c.line, "program must start with HAI (nothing is allowed before HAI)")
+                    self.pre_reported = True
+                    break
+        if self.kthxbye_line is not None:
+            for c in self.comment_tokens:
+                if c.line > self.kthxbye_line:
+                    self.err(c.line, "nothing is allowed after KTHXBYE")
+                    break
         if not self.seen_hai:
             self.err(self.first_line, "missing HAI")
         if not self.seen_kthxbye:
             self.err(self.last_line, "missing KTHXBYE")
+            if self.seen_hai and not self.body_started:
+                self.err(self.last_line, "program must contain at least one statement (<code_block> is mandatory)")
         if self.phase == "DECL" and not self.seen_kthxbye:
             self.err(self.last_line, "WAZZUP block was never closed with BUHBYE")
         for f in self.frames[1:]:
@@ -1281,6 +1309,7 @@ class SemanticAnalyzer:
             vals = [self._eval_expr(cur, line)]
             while cur.match("AN"):
                 vals.append(self._eval_expr(cur, line))
+            cur.match("MKAY")
             return Val(YARN, "".join(self._rt_to_yarn(v, line) for v in vals))
         if k == "MAEK":
             cur.next()
@@ -1502,8 +1531,7 @@ class SemanticAnalyzer:
         if k == "VISIBLE":
             cur.next()
             parts = [self._to_visible_str(self._eval_expr(cur, line))]
-            while not cur.at_end():
-                cur.match("AN")
+            while cur.match("+"):
                 parts.append(self._to_visible_str(self._eval_expr(cur, line)))
             self.output_fn("".join(parts))
             return pc + 1
@@ -1667,40 +1695,54 @@ def _self_test() -> None:
 
     good = (
         "HAI\nWAZZUP\n  I HAS A temp ITZ 2\n  I HAS A name\n  I HAS A r ITZ 0\nBUHBYE\n"
-        "GIMMEH name\nVISIBLE \"Hi \" name\n"
+        "GIMMEH name\nVISIBLE \"Hi \" + name\n"
         "IM IN YR print10 UPPIN YR temp TIL BOTH SAEM temp AN 10\n  VISIBLE temp\nIM OUTTA YR print10\n"
         "r R I IZ add YR 1 AN YR 2 MKAY\nVISIBLE r\n"
         "BOTH SAEM r AN 3\nO RLY?\nYA RLY\n  VISIBLE \"yes\"\nNO WAI\n  VISIBLE \"no\"\nOIC\n"
         "r\nWTF?\nOMG 3\n  VISIBLE \"three\"\n  GTFO\nOMGWTF\n  VISIBLE \"other\"\nOIC\n"
-        "KTHXBYE\n"
         "HOW IZ I add YR a AN YR b\n  FOUND YR SUM OF a AN b\nIF U SAY SO\n"
+        "KTHXBYE\n"
     )
     e, w = run(good)
     assert e == [], e
 
     assert has(run("HAI\nVISIBLE x\nKTHXBYE\n")[0], "used before being declared")
-    assert has(run("HAI\nWAZZUP\nI HAS A x\nI HAS A x\nBUHBYE\nKTHXBYE\n")[0], "already declared")
-    assert has(run("HAI\nWAZZUP\nI HAS A x ITZ x\nBUHBYE\nKTHXBYE\n")[0], "own initializer")      # [CI-11] 11.3.2
-    assert has(run("HAI\nI HAS A x\nKTHXBYE\n")[0], "inside the WAZZUP")
+    assert has(run("HAI\nWAZZUP\nI HAS A x\nI HAS A x\nBUHBYE\nVISIBLE x\nKTHXBYE\n")[0], "already declared")
+    assert has(run("HAI\nWAZZUP\nI HAS A x ITZ x\nBUHBYE\nVISIBLE x\nKTHXBYE\n")[0], "own initializer")      # [CI-11] 11.3.2
+    assert has(run("HAI\nI HAS A x\nVISIBLE 1\nKTHXBYE\n")[0], "inside the WAZZUP")
+    assert has(run("HAI\nHOW IZ I f\n  I HAS A x ITZ 1\n  FOUND YR x\nIF U SAY SO\nVISIBLE I IZ f MKAY\nKTHXBYE\n")[0], "inside the WAZZUP")
     assert has(run("HAI\nVISIBLE 1\n")[0], "missing KTHXBYE")
     assert has(run("VISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
+    assert has(run("BTW comment before HAI\nHAI\nVISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
+    assert has(run("HAI\nVISIBLE 1\nKTHXBYE\nBTW comment after KTHXBYE\n")[0], "after KTHXBYE")
+    assert has(run("HOW IZ I f\n  VISIBLE 1\nIF U SAY SO\nHAI\nVISIBLE 1\nKTHXBYE\n")[0], "start with HAI")
+    assert has(run("HAI\nVISIBLE 1\nKTHXBYE\nHOW IZ I f\n  VISIBLE 1\nIF U SAY SO\n")[0], "after KTHXBYE")
+    assert has(run("HAI\nKTHXBYE\n")[0], "<code_block> is mandatory")
+    assert has(run("HAI\nWAZZUP\n  I HAS A x ITZ 1\nBUHBYE\nKTHXBYE\n")[0], "<code_block> is mandatory")
+    assert not run("HAI BTW inline comment\nVISIBLE 1 + 2 BTW inline comment\nKTHXBYE BTW inline comment\n")[0]
+    assert has(run("HAI\nVISIBLE \"a\" \"b\"\nKTHXBYE\n")[0], "separated by '+'")
+    assert has(run("HAI\nVISIBLE \"a\" AN \"b\"\nKTHXBYE\n")[0], "separated by '+'")
     assert has(run("HAI\nWAZZUP\nI HAS A s ITZ \"abc\"\nBUHBYE\nVISIBLE SUM OF 1 AN \"abc\"\nKTHXBYE\n")[0], "cannot be cast")
     assert has(run("HAI\nWAZZUP\nI HAS A n\nBUHBYE\nVISIBLE SUM OF n AN 1\nKTHXBYE\n")[0], "NOOB")
     assert not run("HAI\nVISIBLE SUM OF \"2\" AN \"7\"\nKTHXBYE\n")[0]
     assert has(run("HAI\nVISIBLE QUOSHUNT OF 5 AN 0\nKTHXBYE\n")[0], "division by constant zero")
     assert has(run("HAI\nVISIBLE ALL OF WIN AN ANY OF WIN AN FAIL MKAY MKAY\nKTHXBYE\n")[0], "cannot be nested")
+    assert has(run("HAI\nVISIBLE BOTH OF WIN AN ALL OF WIN AN FAIL MKAY\nKTHXBYE\n")[0], "cannot be nested")
     assert has(run("HAI\nVISIBLE ALL OF WIN AN FAIL\nKTHXBYE\n")[0], "MKAY")
     assert not run("HAI\nVISIBLE ALL OF NOT WIN AN BOTH OF WIN AN FAIL AN EITHER OF WIN AN FAIL MKAY\nKTHXBYE\n")[0]
     assert has(run("HAI\nVISIBLE SUM OF 1 2\nKTHXBYE\n")[0], "'AN'")
     assert has(run("HAI\nVISIBLE SUM OF 1 AN SMOOSH \"a\" AN \"b\"\nKTHXBYE\n")[0], "SMOOSH cannot be nested")
+    assert has(run("HAI\nVISIBLE SMOOSH \"a\" AN SMOOSH \"b\" AN \"c\"\nKTHXBYE\n")[0], "SMOOSH cannot be nested")
+    assert has(run("HAI\nHOW IZ I id YR x\n  FOUND YR x\nIF U SAY SO\nVISIBLE I IZ id YR SMOOSH \"a\" AN \"b\" MKAY\nKTHXBYE\n")[0], "SMOOSH cannot be nested")
+    assert has(run("HAI\nHOW IZ I id YR x\n  FOUND YR x\nIF U SAY SO\nVISIBLE I IZ id YR ALL OF WIN AN FAIL MKAY MKAY\nKTHXBYE\n")[0], "cannot be nested")
     assert has(run("HAI\nGTFO\nKTHXBYE\n")[0], "GTFO is only valid")
     assert has(run("HAI\nFOUND YR 1\nKTHXBYE\n")[0], "only valid inside a function")
     # functions
     assert has(run("HAI\nVISIBLE I IZ f MKAY\nKTHXBYE\n")[0], "undefined function")
-    assert has(run("HAI\nVISIBLE I IZ f YR 1 MKAY\nKTHXBYE\nHOW IZ I f\nFOUND YR 1\nIF U SAY SO\n")[0], "takes 0")
-    assert has(run("HAI\nWAZZUP\nI HAS A g ITZ 1\nBUHBYE\nKTHXBYE\nHOW IZ I f\nFOUND YR g\nIF U SAY SO\n")[0], "outer variable")
-    assert has(run("HOW IZ I f\nIF U SAY SO\nHOW IZ I f\nIF U SAY SO\nHAI\nKTHXBYE\n")[0], "already defined")
-    assert not run("HOW IZ I f\nVISIBLE 1\nIF U SAY SO\nHAI\nVISIBLE I IZ f MKAY\nKTHXBYE\n")[0]
+    assert has(run("HAI\nVISIBLE I IZ f YR 1 MKAY\nHOW IZ I f\nFOUND YR 1\nIF U SAY SO\nKTHXBYE\n")[0], "takes 0")
+    assert has(run("HAI\nWAZZUP\nI HAS A g ITZ 1\nBUHBYE\nHOW IZ I f\nFOUND YR g\nIF U SAY SO\nVISIBLE g\nKTHXBYE\n")[0], "outer variable")
+    assert has(run("HAI\nHOW IZ I f\nIF U SAY SO\nHOW IZ I f\nIF U SAY SO\nVISIBLE 1\nKTHXBYE\n")[0], "already defined")
+    assert not run("HAI\nHOW IZ I f\nVISIBLE 1\nIF U SAY SO\nVISIBLE I IZ f MKAY\nKTHXBYE\n")[0]
     # loops / switch / if
     assert has(run("HAI\nWAZZUP\nI HAS A i ITZ 0\nBUHBYE\nIM IN YR a UPPIN YR i TIL BOTH SAEM i AN 3\nIM OUTTA YR b\nKTHXBYE\n")[0], "does not match")
     assert has(run("HAI\nIM IN YR a UPPIN YR zz TIL WIN\nIM OUTTA YR a\nKTHXBYE\n")[0], "used before being declared")
