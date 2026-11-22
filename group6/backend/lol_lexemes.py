@@ -61,6 +61,7 @@ KEYWORD_GROUPS = [
     ("Assignment Keyword",           ["R"]),
     ("Operand Separator",            ["AN"]),
     ("Output Keyword",               ["VISIBLE"]),
+    ("Output Separator",             ["+"]),
     ("Input Keyword",                ["GIMMEH"]),
     ("Concatenation Keyword",        ["SMOOSH"]),
     ("Arithmetic Operator",          ["SUM OF", "DIFF OF", "PRODUKT OF",
@@ -375,8 +376,18 @@ def _self_test() -> None:
     assert classify_lexeme("R") == ("Assignment Keyword", "")
     # operand separator
     assert classify_lexeme("AN") == ("Operand Separator", "")
-    # output keyword
+    # output keyword and separator
     assert classify_lexeme("VISIBLE") == ("Output Keyword", "")
+    assert classify_lexeme("+") == ("Output Separator", "")
+    t, e = kinds('VISIBLE "Hi " + name')
+    assert e == [] and t == [
+        ("VISIBLE", "Output Keyword"),
+        ('"', CLASS_STRING_DELIMITER),
+        ("Hi ", CLASS_LITERAL),
+        ('"', CLASS_STRING_DELIMITER),
+        ("+", "Output Separator"),
+        ("name", CLASS_VAR_IDENT),
+    ]
     # input keyword
     assert classify_lexeme("GIMMEH") == ("Input Keyword", "")
     # concatenation keyword
