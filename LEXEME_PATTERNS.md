@@ -28,6 +28,7 @@
 | `DIFFRINT` | `DIFFRINT(?=\s\|$)` | Comparison Operator |
 | `KTHXBYE` | `KTHXBYE(?=\s\|$)` | Code Delimiter |
 | `VISIBLE` | `VISIBLE(?=\s\|$)` | Output Keyword |
+| `+` | `\+(?=\s\|$)` | Output Separator |
 | `WAZZUP` | `WAZZUP(?=\s\|$)` | Declaration Block Delimiter |
 | `BUHBYE` | `BUHBYE(?=\s\|$)` | Declaration Block Delimiter |
 | `GIMMEH` | `GIMMEH(?=\s\|$)` | Input Keyword |
