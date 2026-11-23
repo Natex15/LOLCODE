@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+Folder="$1"
+for file in "$Folder"/*; do
+    echo "File $file: "
+    cat "$file"
+    echo ""
+    echo "Output"
+    python3 group6/backend/lol_semantics.py "$file"
+    echo "--------------"
+done
